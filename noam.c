@@ -457,21 +457,22 @@ void noam_prefix_tree_insert(noam_prefix_node* root, const char* keyword, noam_t
     parent->token = token;
 }
 
-noam_token noam_prefix_tree_find(noam_prefix_node* root, const char* keyword){
+noam_token noam_prefix_tree_find(noam_prefix_node* root, noam_buffer* keyword){
     noam_prefix_node* parent = root;
 
-    for(const char* k = keyword; *k != '\0'; ++k){
+    for(size_t i = 0; i < keyword->length; ++i){
+        char k = *(char*)noam_buffer_at(keyword, i);
         noam_prefix_node* node = parent->child;
 
         if(!node){
             return NOAM_ERROR_TOKEN;
         }
 
-        while(node->character != *k && node->next){
+        while(node->character != k && node->next){
             node = node->next;
         }
 
-        if(node->character != *k){
+        if(node->character != k){
             return NOAM_ERROR_TOKEN;
         }
 
@@ -525,8 +526,8 @@ noam_buffer* noam_parse_tokens(const char* source){
                 if(isalpha(*c) || isdigit(*c)){
                     noam_buffer_push(token_name, c);
                 } else {
-                    noam_token token = noam_prefix_tree_find(keywords_tree, token_name->data);
-
+                    noam_token token = noam_prefix_tree_find(keywords_tree, token_name);
+                    //printf("%s ", (const char*)token_name->data);
                     if(token != NOAM_ERROR_TOKEN){
                         noam_buffer_push(tokens, noam_token_info_create(token_name, token));
                     } else {
