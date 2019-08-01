@@ -32,8 +32,14 @@ typedef enum {
     NOAM_OP_TOKEN,
     NOAM_LP_TOKEN,
     NOAM_RP_TOKEN,
+    NOAM_LB_TOKEN,
+    NOAM_RB_TOKEN,
     NOAM_EOF_TOKEN
 } noam_token;
+
+#define NOAM_IF_TOKEN "if"
+#define NOAM_PRINT_TOKEN "print"
+#define NOAM_FUNC_TOKEN "func"
 
 typedef void(*noam_release_func)(void*);
 
@@ -64,20 +70,34 @@ typedef struct {
     noam_release_func release;
 } noam_dict;
 
-typedef struct {
-    noam_dict* vars;
-} noam_scope;
 
 typedef struct {
     noam_buffer* name;
-    noam_token token;
+    noam_token   token;
 } noam_token_info;
 
 typedef struct {
     noam_buffer* tokens;
     size_t       index;
-    noam_scope*  scope;
 } noam_parser;
+
+typedef struct noam_scope {
+    noam_dict*         vars;
+    struct noam_scope* parent;
+    struct noam_scope* next;
+    struct noam_scope* child;
+} noam_scope;
+
+typedef struct {
+    noam_buffer* name;
+    noam_buffer* params;
+    noam_buffer* body;
+} noam_func;
+
+typedef struct {
+    noam_dict* funcs;
+    noam_scope* head;
+} noam_symbol_table;
 
 struct noam_statement;
 struct noam_value;
@@ -86,27 +106,6 @@ struct noam_expression;
 typedef void(*noam_statement_run_func)(struct noam_statement*);
 typedef struct noam_value*(*noam_expression_get_func)(struct noam_expression*);
 typedef const char*(*noam_value_to_string_func)(struct noam_value*);
-
-typedef struct {
-    noam_statement_run_func run;
-    noam_release_func       release;
-} noam_statement_vtable_;
-
-typedef struct noam_statement {
-    const noam_statement_vtable_* vtable_;
-} noam_statement;
-
-typedef struct {
-    noam_statement_vtable_* vtable_;
-    struct noam_expression* expr;
-} noam_print_statement;
-
-typedef struct {
-    noam_statement_vtable_* vtable_;
-    noam_buffer*            name;
-    struct noam_expression* expr;
-    noam_scope*             scope;
-} noam_assignment_statement;
 
 typedef struct {
     noam_expression_get_func get;
@@ -129,6 +128,13 @@ typedef struct {
     noam_buffer*             name;
     noam_scope*              scope;
 } noam_variable_expression;
+
+typedef struct {
+    noam_expression_vtable_* vtable_;
+    noam_buffer*             name;
+    noam_buffer*             args;
+    noam_symbol_table*       symbol_table;
+} noam_func_call_expression;
 
 typedef struct noam_value {
     noam_value_vtable_* vtable_;
@@ -155,6 +161,32 @@ typedef struct {
     noam_expression*         lhs;
     noam_expression*         rhs;
 } noam_op_expression;
+
+typedef struct {
+    noam_statement_run_func run;
+    noam_release_func       release;
+} noam_statement_vtable_;
+
+typedef struct noam_statement {
+    const noam_statement_vtable_* vtable_;
+} noam_statement;
+
+typedef struct {
+    noam_statement_vtable_* vtable_;
+    struct noam_expression* expr;
+} noam_print_statement;
+
+typedef struct {
+    noam_statement_vtable_* vtable_;
+    noam_buffer*            name;
+    struct noam_expression* expr;
+    noam_scope*             scope;
+} noam_assignment_statement;
+
+typedef struct {
+    noam_statement_vtable_*    vtable_;
+    noam_func_call_expression* func_call;
+} noam_func_call_statement;
 
 noam_buffer* noam_buffer_createv(size_t chunk, noam_release_func release){
     noam_buffer* buffer = malloc(sizeof(noam_buffer));
@@ -216,6 +248,10 @@ void noam_buffer_assign(noam_buffer* buffer, void* data, size_t length){
 
 void noam_buffer_merge(noam_buffer* buffer, noam_buffer* other){
     noam_buffer_assign(buffer, other->data, other->length);
+}
+
+int noam_buffer_empty(noam_buffer* buffer){
+    return buffer->length == 0;
 }
 
 void noam_buffer_clear(noam_buffer* buffer){
@@ -317,10 +353,11 @@ void noam_dict_release(noam_dict* dict){
 }
 
 noam_token noam_char_to_token(char c){
-    static const char* tokens_char = "\n=+-*/<>()";
+    static const char* tokens_char = "\n=+-*/<>(){}";
     static const noam_token tokens_type[] = { NOAM_LINE_TOKEN, NOAM_EQ_TOKEN, NOAM_OP_TOKEN,
                                               NOAM_OP_TOKEN, NOAM_OP_TOKEN, NOAM_OP_TOKEN, NOAM_OP_TOKEN,
-                                              NOAM_OP_TOKEN, NOAM_LP_TOKEN, NOAM_RP_TOKEN };
+                                              NOAM_OP_TOKEN, NOAM_LP_TOKEN, NOAM_RP_TOKEN,
+                                              NOAM_LB_TOKEN, NOAM_RB_TOKEN };
 
     for(const char* token = tokens_char; *token != '\0'; ++token){
         if(*token == c)
@@ -466,6 +503,12 @@ noam_token_info* noam_consume_token(noam_parser* parser, noam_token token){
     return info;
 }
 
+noam_token_info* noam_consume_token_str(noam_parser* parser, const char* name){
+    if(!noam_match_token_str(parser, name))
+        return NULL;
+    return noam_get_token_info(parser, -1);
+}
+
 noam_value* noam_expression_get(noam_expression* expression){
     return expression->vtable_->get(expression);
 }
@@ -481,7 +524,15 @@ void noam_expression_release(noam_expression* expression){
 }
 
 noam_value* noam_variable_expression_get(noam_variable_expression* expression){
-    noam_dict_node* node = noam_dict_find(expression->scope->vars, expression->name);
+    noam_scope* scope = expression->scope;
+    noam_dict_node* node = NULL;
+
+    while(scope){
+        if((node = noam_dict_find(scope->vars, expression->name)))
+            break;
+        scope = scope->parent;
+    }
+
     if(!node){
         fprintf(stderr, "noam: unknown variable");
         exit(-1);
@@ -493,6 +544,47 @@ noam_value* noam_variable_expression_get(noam_variable_expression* expression){
 
 void noam_variable_expression_release(noam_variable_expression* expression){
     noam_buffer_release(expression->name);
+}
+
+void noam_statement_run(noam_statement* statement);
+
+noam_value* noam_func_call_expression_get(noam_func_call_expression* expression){
+    noam_dict_node* node = noam_dict_find(expression->symbol_table->funcs, expression->name);
+
+    if(!node){
+        //TODO: Error
+        fprintf(stderr, "unknown function");
+        exit(-1);
+    }
+
+    noam_func* func = noam_dict_value(expression->symbol_table->funcs, node);
+
+    //TODO: Find scope
+    noam_scope* scope = expression->symbol_table->head->child;
+
+    if(expression->args->length != func->params->length){
+        //TODO: Error
+        fprintf(stderr, "param num mismatch");
+        exit(-1);
+    }
+
+    for(size_t i = 0; i < expression->args->length; ++i){
+        noam_buffer* param = noam_buffer_at(func->params, i);
+        noam_buffer* arg = noam_buffer_at(expression->args, i);
+        noam_dict_insert(scope->vars, param, arg);
+    }
+
+    for(size_t i = 0; i < func->body->length; ++i){
+        noam_statement** statement = noam_buffer_at(func->body, i);
+        noam_statement_run(*statement);
+    }
+
+    return 0;
+}
+
+void noam_func_call_expression_release(noam_func_call_expression* expression){
+    noam_buffer_release(expression->name);
+    noam_buffer_release(expression->args);
 }
 
 noam_value* noam_int_value_get(noam_int_value* value){
@@ -538,6 +630,18 @@ noam_variable_expression* noam_variable_expression_create(noam_buffer* name, noa
     expression->vtable_ = noam_variable_expression_vtable;
     expression->name = name;
     expression->scope = scope;
+    return expression;
+}
+
+noam_func_call_expression* noam_func_call_expression_create(
+        noam_buffer* name, noam_buffer* args, noam_symbol_table* symbol_table){
+    static noam_expression_vtable_ noam_func_call_expression_vtable[] = {{&noam_func_call_expression_get,
+                                                                          &noam_func_call_expression_release}};
+    noam_func_call_expression* expression = malloc(sizeof(noam_func_call_expression));
+    expression->vtable_ = noam_func_call_expression_vtable;
+    expression->name = name;
+    expression->args = args;
+    expression->symbol_table = symbol_table;
     return expression;
 }
 
@@ -649,12 +753,36 @@ noam_op_expression* noam_op_expression_create(noam_expression* lhs, char op, noa
     return expression;
 }
 
-noam_expression* noam_parse_expression(noam_parser* parser);
+noam_expression* noam_parse_expression(noam_parser* parser, noam_symbol_table* symbol_table, noam_scope* current_scope);
 
-noam_expression* noam_parse_atomic(noam_parser* parser){
+noam_buffer* noam_parse_func_args(noam_parser* parser, noam_symbol_table* symbol_table, noam_scope* current_scope){
+    noam_buffer* args = noam_buffer_createv(sizeof(noam_expression*), &noam_expression_release);
+
+    if(!noam_match_token(parser, NOAM_RP_TOKEN)){
+        noam_expression* arg = noam_parse_expression(parser, symbol_table, current_scope);
+        noam_buffer_push(args, &arg);
+
+        while(!noam_match_token(parser, NOAM_RP_TOKEN)){
+            if(!noam_match_token_str(parser, ",")){
+                //TODO: Error
+            }
+            arg = noam_parse_expression(parser, symbol_table, current_scope);
+            noam_buffer_push(args, &arg);
+        }
+    }
+
+    return args;
+}
+
+noam_expression* noam_parse_atomic(noam_parser* parser, noam_symbol_table* symbol_table, noam_scope* current_scope){
     if(noam_match_token(parser, NOAM_WORD_TOKEN)){
         noam_token_info* info = noam_get_token_info(parser, -1);
-        return noam_variable_expression_create(info->name, parser->scope);
+        if(noam_match_token(parser, NOAM_LP_TOKEN)){
+            noam_buffer* args = noam_parse_func_args(parser, symbol_table, current_scope);
+            return noam_func_call_expression_create(info->name, args, symbol_table);
+        } else {
+            return noam_variable_expression_create(info->name, current_scope);
+        }
     } else if(noam_match_token(parser, NOAM_INT_TOKEN)){
         return noam_int_value_create(atoi(noam_get_token_info(parser, -1)->name->data));
     } else if(noam_match_token(parser, NOAM_FLOAT_TOKEN)){
@@ -663,9 +791,9 @@ noam_expression* noam_parse_atomic(noam_parser* parser){
         noam_token_info* info = noam_get_token_info(parser, -1);
         return noam_string_value_create(info->name);
     } else if(noam_match_token(parser, NOAM_LP_TOKEN)){
-        noam_expression* expression = noam_parse_expression(parser);
+        noam_expression* expression = noam_parse_expression(parser, symbol_table, current_scope);
 
-        if(!noam_consume_token(parser, NOAM_RP_TOKEN)){
+        if(!noam_match_token(parser, NOAM_RP_TOKEN)){
             //TODO: Error
         }
 
@@ -675,12 +803,12 @@ noam_expression* noam_parse_atomic(noam_parser* parser){
     return NULL;
 }
 
-noam_expression* noam_parse_op(noam_parser* parser){
-    noam_expression* lhs_expression = noam_parse_atomic(parser);
+noam_expression* noam_parse_op(noam_parser* parser, noam_symbol_table* symbol_table, noam_scope* current_scope){
+    noam_expression* lhs_expression = noam_parse_atomic(parser, symbol_table, current_scope);
 
     while(noam_match_token(parser, NOAM_OP_TOKEN)){
         noam_token_info* op = noam_get_token_info(parser, -1);
-        noam_expression* rhs_expression = noam_parse_atomic(parser);
+        noam_expression* rhs_expression = noam_parse_atomic(parser, symbol_table, current_scope);
         //TODO: Generalize op type to string
         return noam_op_expression_create(lhs_expression, *(char*)noam_buffer_at(op->name, 0), rhs_expression);
     }
@@ -688,8 +816,8 @@ noam_expression* noam_parse_op(noam_parser* parser){
     return lhs_expression;
 }
 
-noam_expression* noam_parse_expression(noam_parser* parser){
-    return noam_parse_op(parser);
+noam_expression* noam_parse_expression(noam_parser* parser, noam_symbol_table* symbol_table, noam_scope* current_scope){
+    return noam_parse_op(parser, symbol_table, current_scope);
 }
 
 void noam_statement_run(noam_statement* statement){
@@ -729,6 +857,15 @@ void noam_assignment_statement_release(noam_assignment_statement* statement){
     noam_buffer_release(statement->name);
 }
 
+void noam_func_call_statement_run(noam_func_call_statement* statement){
+    //TODO: Call func
+    noam_expression_get(statement->func_call);
+}
+
+void noam_func_call_statement_release(noam_func_call_statement* statement){
+    noam_expression_release(statement->func_call);
+}
+
 noam_assignment_statement* noam_assignment_statement_create(noam_buffer* name,
                                                             noam_expression* expression,
                                                             noam_scope* scope){
@@ -739,6 +876,15 @@ noam_assignment_statement* noam_assignment_statement_create(noam_buffer* name,
     statement->name = name;
     statement->expr = expression;
     statement->scope = scope;
+    return statement;
+}
+
+noam_func_call_statement* noam_func_call_statement_create(noam_func_call_expression* func_call){
+    static noam_statement_vtable_ noam_func_call_statement_vtable[] = {{&noam_func_call_statement_run,
+                                                                        &noam_func_call_statement_release}};
+    noam_func_call_statement* statement = malloc(sizeof(noam_func_call_statement));
+    statement->vtable_ = noam_func_call_statement_vtable;
+    statement->func_call = func_call;
     return statement;
 }
 
@@ -758,45 +904,219 @@ int noam_cmp_string(const noam_buffer* lhs, const noam_buffer* rhs){
 }
 
 void noam_scope_vars_release(void* data){
-    //TODO
+    noam_buffer_release(data);
+    noam_expression_release(*(noam_expression**)((char*)data + sizeof(noam_buffer)));
 }
 
 noam_scope* noam_scope_create(){
     noam_scope* scope = malloc(sizeof(noam_scope));
-    scope->vars = noam_dict_createv(sizeof(noam_buffer), sizeof(noam_expression*),
+    memset(scope, 0, sizeof(noam_scope));
+    scope->vars = noam_dict_createv(sizeof(noam_buffer), sizeof(noam_value*),
                                     &noam_hash_string, &noam_cmp_string,
                                     &noam_scope_vars_release);
     return scope;
 }
 
-void noam_scope_release(noam_scope* scope){
-    noam_dict_release(scope->vars);
+noam_scope* noam_scope_add_child(noam_scope* parent){
+    noam_scope* scope = noam_scope_create();
+    parent->child = scope;
+    scope->parent = parent;
+    scope->next = NULL;
+    scope->child = NULL;
+    return scope;
 }
 
-noam_buffer* noam_parse_statements(noam_parser* parser, noam_buffer* scopes){
-    noam_buffer* statements = noam_buffer_createv(sizeof(noam_statement*), &noam_statement_release);
-    noam_buffer_push(scopes, noam_scope_create()); //global scope
-    parser->scope = noam_buffer_last(scopes);
+noam_scope* noam_scope_add_sibling(noam_scope* prev){
+    noam_scope* scope = noam_scope_create();
+    prev->next = scope;
+    scope->parent = prev->parent;
+    scope->next = NULL;
+    scope->child = NULL;
+    return scope;
+}
 
-    for(;;){
-        if(parser->index >= parser->tokens->length)
-            break;
+void noam_scope_release(noam_scope* head){
+    while(head){
+        noam_scope* node = head;
+        noam_dict_release(head->vars);
+        free(head);
+        head = node->next;
+    }
+}
+
+noam_func* noam_func_create(noam_buffer* name, noam_buffer* params, noam_buffer* body){
+    noam_func* func = malloc(sizeof(noam_func));
+    func->name = name;
+    func->params = params;
+    func->body = body;
+    return func;
+}
+
+void noam_func_release(noam_func* func){
+    noam_buffer_release(func->name);
+    noam_buffer_release(func->params);
+    //TODO: Statement release throws right now
+    //noam_buffer_release(func->body);
+}
+
+void noam_symbol_table_funcs_release(void* data){
+    noam_buffer_release(data);
+    noam_func_release((noam_func*)((char*)data + sizeof(noam_buffer)));
+}
+
+noam_symbol_table* noam_symbol_table_create(){
+    noam_symbol_table* symbol_table = malloc(sizeof(noam_symbol_table));
+    symbol_table->head = noam_scope_create();
+    symbol_table->funcs = noam_dict_createv(sizeof(noam_buffer), sizeof(noam_func),
+                                            &noam_hash_string, &noam_cmp_string,
+                                            &noam_symbol_table_funcs_release);
+    return symbol_table;
+}
+
+void noam_symbol_table_release(noam_symbol_table* symbol_table){
+    noam_dict_release(symbol_table->funcs);
+    //TODO: Traverse tree
+    //noam_scope_release(symbol_table->head);
+}
+
+int noam_parser_end(noam_parser* parser){
+    return parser->index < parser->tokens->length;
+}
+
+noam_buffer* noam_parse_block(noam_parser* parser, noam_symbol_table* symbol_table, noam_scope* current_scope){
+
+    noam_buffer* statements = noam_buffer_create(sizeof(noam_statement*));
+
+    while(noam_parser_end(parser)){
+
         while(noam_match_token(parser, NOAM_LINE_TOKEN));
 
         if(noam_match_tokens(parser, NOAM_WORD_TOKEN, NOAM_EQ_TOKEN)){
             noam_token_info* info = noam_get_token_info(parser, -2);
-            noam_expression* expression = noam_parse_expression(parser);
+            noam_expression* expression = noam_parse_expression(parser, symbol_table, current_scope);
             void* assigment_statement = noam_assignment_statement_create(
-                    info->name, expression, noam_buffer_last(scopes)
+                    info->name, expression, current_scope
             );
             noam_buffer_push(statements, &assigment_statement);
-        } else if (noam_match_token_str(parser, "print")){
-            void* print_statement = noam_print_statement_create(noam_parse_expression(parser));
+        } else if (noam_match_token_str(parser, NOAM_PRINT_TOKEN)){
+            void* print_statement = noam_print_statement_create(
+                    noam_parse_expression(parser, symbol_table, current_scope)
+            );
             noam_buffer_push(statements, &print_statement);
+        } else if(noam_match_token_str(parser, NOAM_IF_TOKEN)){
+            noam_expression* expression = noam_parse_expression(parser, symbol_table, current_scope);
+            //noam_consume_token(parser, NOAM_LB_TOKEN);
+
+            //noam_consume_token(parser, NOAM_RB_TOKEN);
+        } else if(noam_match_tokens(parser, NOAM_WORD_TOKEN, NOAM_LP_TOKEN)){
+            noam_token_info* info = noam_get_token_info(parser, -2);
+            noam_buffer* args = noam_parse_func_args(parser, symbol_table, current_scope);
+            void* func_call_statement = noam_func_call_statement_create(
+                    noam_func_call_expression_create(info->name, args, symbol_table)
+            );
+            noam_buffer_push(statements, &func_call_statement);
+        } else if(noam_match_token(parser, NOAM_LB_TOKEN)) {
+            noam_buffer* block = noam_parse_block(parser, symbol_table, noam_scope_add_child(current_scope));
+
+            if (!noam_match_token(parser, NOAM_RB_TOKEN)) {
+                //TODO: Error
+            }
+
+            if(!noam_buffer_empty(block)){
+                noam_buffer_merge(statements, block);
+            }
+
+            noam_buffer_release(block);
         } else {
             break;
         }
 
+    }
+
+    return statements;
+}
+
+void noam_parse_func(noam_parser* parser, noam_symbol_table* symbol_table, noam_scope* scope){
+    noam_token_info* func_name = noam_consume_token(parser, NOAM_WORD_TOKEN);
+
+    if(!func_name){
+        //TODO: Error
+    }
+
+    if(!noam_match_token(parser, NOAM_LP_TOKEN)){
+        //TODO: Error
+    }
+
+    noam_buffer* params = noam_buffer_createv(sizeof(noam_buffer), &noam_buffer_release);
+
+    if(!noam_match_token(parser, NOAM_RP_TOKEN)){
+        noam_token_info* param = noam_consume_token(parser, NOAM_WORD_TOKEN);
+
+        if(!param){
+            //TODO: Error
+        }
+
+        noam_buffer_push(params, param->name);
+
+        while(!noam_match_token(parser, NOAM_RP_TOKEN)){
+
+            if(!noam_match_token_str(parser, ",")){
+                //TODO: Error
+            }
+
+            param = noam_consume_token(parser, NOAM_WORD_TOKEN);
+
+            if(!param){
+                //TODO: Error
+            }
+
+            noam_buffer_push(params, param->name);
+        }
+    }
+
+    if(!noam_match_token(parser, NOAM_LB_TOKEN)){
+        //TODO: Error
+    }
+
+    noam_scope* func_scope = NULL;
+
+    if(!scope){
+        func_scope = noam_scope_add_child(symbol_table->head);
+    } else {
+        func_scope = noam_scope_add_sibling(scope);
+    }
+
+    //TODO: Check that releases
+    noam_buffer* body = noam_buffer_createv(sizeof(noam_statement*), &noam_statement_release);
+
+    while(!noam_match_token(parser, NOAM_RB_TOKEN)){
+        noam_buffer* block = noam_parse_block(parser, symbol_table, func_scope);
+
+        if(!noam_buffer_empty(block)){
+            noam_buffer_merge(body, block);
+        }
+
+        noam_buffer_release(block);
+    }
+
+    noam_func* func = noam_func_create(func_name->name, params, body);
+    noam_dict_insert(symbol_table->funcs, func_name->name, func);
+}
+
+noam_buffer* noam_parse_statements(noam_parser* parser, noam_symbol_table* symbol_table){
+    noam_buffer* statements = noam_buffer_createv(sizeof(noam_statement*), &noam_statement_release);
+    noam_scope* last_scope = NULL;
+
+    while(noam_parser_end(parser)){
+        if(noam_match_token_str(parser, NOAM_FUNC_TOKEN)){
+            noam_parse_func(parser, symbol_table, last_scope);
+        } else {
+            noam_buffer* block = noam_parse_block(parser, symbol_table, symbol_table->head);
+            if(noam_buffer_empty(block))
+                break;
+            noam_buffer_merge(statements, block);
+            noam_buffer_release(block);
+        }
     }
 
     return statements;
@@ -832,9 +1152,8 @@ int main(int argc, char** argv) {
     noam_parser parser = {0};
     parser.tokens = noam_parse_tokens(file_source->data);
 
-    noam_buffer* scopes = noam_buffer_createv(sizeof(noam_scope*), &noam_scope_release);
-
-    noam_buffer* statements = noam_parse_statements(&parser, scopes);
+    noam_symbol_table* symbol_table = noam_symbol_table_create();
+    noam_buffer* statements = noam_parse_statements(&parser, symbol_table);
     size_t current = 0;
 
     while(current < statements->length){
@@ -842,7 +1161,7 @@ int main(int argc, char** argv) {
         noam_statement_run(*statement);
     }
 
-    noam_buffer_release(scopes);
+    noam_symbol_table_release(symbol_table);
     noam_buffer_release(file_source);
     noam_buffer_release(parser.tokens);
 
