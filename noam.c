@@ -3,11 +3,16 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define NOAM_TOKEN_MAX_LENGTH 256
 #define NOAM_BUFFER_GROW_FACTOR 2
 #define NOAM_CHAR_BIT 8
 #define NOAM_INT_CHAR_LENGTH ((NOAM_CHAR_BIT * sizeof(int) - 1) / 3 + 2)
 #define NOAM_FLOAT_CHAR_LENGTH ((NOAM_CHAR_BIT * sizeof(float) - 1) / 3 + 2)
+
+#define NOAM_IF_TOKEN_STR "if"
+#define NOAM_PRINT_TOKEN_STR "print"
+#define NOAM_FUNC_TOKEN_STR "func"
+#define NOAM_TRUE_TOKEN_STR "true"
+#define NOAM_FALSE_TOKEN_STR "false"
 
 //TODO: Memory management awareness
 // Release all the stuff
@@ -27,6 +32,7 @@ typedef enum {
     NOAM_INT_TOKEN,
     NOAM_FLOAT_TOKEN,
     NOAM_STRING_TOKEN,
+    NOAM_BOOL_TOKEN,
     NOAM_LINE_TOKEN,
     NOAM_EQ_TOKEN,
     NOAM_OP_TOKEN,
@@ -37,9 +43,13 @@ typedef enum {
     NOAM_EOF_TOKEN
 } noam_token;
 
-#define NOAM_IF_TOKEN "if"
-#define NOAM_PRINT_TOKEN "print"
-#define NOAM_FUNC_TOKEN "func"
+typedef struct noam_prefix_node {
+    struct noam_prefix_node* parent;
+    struct noam_prefix_node* next;
+    struct noam_prefix_node* child;
+    char                     character;
+    noam_token               token;
+} noam_prefix_node;
 
 typedef void(*noam_release_func)(void*);
 
@@ -156,6 +166,11 @@ typedef struct {
 } noam_string_value;
 
 typedef struct {
+    noam_value_vtable_* vtable_;
+    int                 value;
+} noam_bool_value;
+
+typedef struct {
     noam_expression_vtable_* vtable_;
     char                     op;
     noam_expression*         lhs;
@@ -187,6 +202,17 @@ typedef struct {
     noam_statement_vtable_*    vtable_;
     noam_func_call_expression* func_call;
 } noam_func_call_statement;
+
+int noam_atob(const char* str){
+    if(strcmp(str, NOAM_TRUE_TOKEN_STR) == 0){
+        return 1;
+    }
+    if(strcmp(str, NOAM_FALSE_TOKEN_STR) == 0){
+        return 0;
+    }
+    //TODO: Error
+    return -1;
+}
 
 noam_buffer* noam_buffer_createv(size_t chunk, noam_release_func release){
     noam_buffer* buffer = malloc(sizeof(noam_buffer));
@@ -384,10 +410,95 @@ void noam_token_info_release(noam_token_info* info){
     free(info->name);
 }
 
+noam_prefix_node* noam_prefix_node_create(char character){
+    noam_prefix_node* node = malloc(sizeof(noam_prefix_node));
+    memset(node, 0, sizeof(noam_prefix_node));
+    node->character = character;
+    node->token = NOAM_ERROR_TOKEN;
+    return node;
+}
+
+noam_prefix_node* noam_prefix_node_add_child(noam_prefix_node* parent, char character){
+    noam_prefix_node* node = noam_prefix_node_create(character);
+    node->parent = parent;
+    parent->child = node;
+    return node;
+}
+
+noam_prefix_node* noam_prefix_node_add_sibling(noam_prefix_node* prev, char character){
+    noam_prefix_node* node = noam_prefix_node_create(character);
+    node->parent = prev->parent;
+    prev->next = node;
+    return node;
+}
+
+void noam_prefix_tree_insert(noam_prefix_node* root, const char* keyword, noam_token token){
+    noam_prefix_node* parent = root;
+
+    for(const char* k = keyword; *k != '\0'; ++k){
+        noam_prefix_node* node = parent->child;
+
+        if(!node){
+            parent = noam_prefix_node_add_child(parent, *k);
+        } else {
+            while(node->character != *k && node->next){
+                node = node->next;
+            }
+
+            if(node->character == *k){
+                parent = node;
+            } else {
+                noam_prefix_node* k_node = noam_prefix_node_add_sibling(node, *k);
+                parent = k_node;
+            }
+        }
+    }
+
+    parent->token = token;
+}
+
+noam_token noam_prefix_tree_find(noam_prefix_node* root, const char* keyword){
+    noam_prefix_node* parent = root;
+
+    for(const char* k = keyword; *k != '\0'; ++k){
+        noam_prefix_node* node = parent->child;
+
+        if(!node){
+            return NOAM_ERROR_TOKEN;
+        }
+
+        while(node->character != *k && node->next){
+            node = node->next;
+        }
+
+        if(node->character != *k){
+            return NOAM_ERROR_TOKEN;
+        }
+
+        parent = node;
+    }
+
+    return parent->token;
+}
+
+noam_prefix_node* noam_prefix_tree_build(const char** keywords, const noam_token* tokens, size_t length){
+    noam_prefix_node* root = noam_prefix_node_create(0);
+
+    for(size_t i = 0; i < length; ++i){
+        noam_prefix_tree_insert(root, keywords[i], tokens[i]);
+    }
+
+    return root;
+}
+
 noam_buffer* noam_parse_tokens(const char* source){
     noam_buffer* tokens = noam_buffer_createv(sizeof(noam_token_info), &noam_token_info_release);
     noam_state state = NOAM_DEFAULT_STATE;
     noam_buffer* token_name = noam_buffer_create(1);
+
+    static const char* keywords[] = { NOAM_TRUE_TOKEN_STR, NOAM_FALSE_TOKEN_STR };
+    static const noam_token keywords_tokens[] = { NOAM_BOOL_TOKEN, NOAM_BOOL_TOKEN };
+    noam_prefix_node* keywords_tree = noam_prefix_tree_build(keywords, keywords_tokens, 2);
 
     for(const char* c = source; *c != '\0'; ++c){
         switch(state){
@@ -414,7 +525,14 @@ noam_buffer* noam_parse_tokens(const char* source){
                 if(isalpha(*c) || isdigit(*c)){
                     noam_buffer_push(token_name, c);
                 } else {
-                    noam_buffer_push(tokens, noam_token_info_create(token_name, NOAM_WORD_TOKEN));
+                    noam_token token = noam_prefix_tree_find(keywords_tree, token_name->data);
+
+                    if(token != NOAM_ERROR_TOKEN){
+                        noam_buffer_push(tokens, noam_token_info_create(token_name, token));
+                    } else {
+                        noam_buffer_push(tokens, noam_token_info_create(token_name, NOAM_WORD_TOKEN));
+                    }
+
                     noam_state_reset(token_name, &state);
                     --c;
                 }
@@ -619,6 +737,14 @@ const char* noam_string_value_to_string(noam_string_value* value){
     return value->str->data;
 }
 
+noam_value* noam_bool_value_get(noam_bool_value* value){
+    return value;
+}
+
+const char* noam_bool_value_to_string(noam_bool_value* value){
+    return value->value == 1 ? NOAM_TRUE_TOKEN_STR : NOAM_FALSE_TOKEN_STR;
+}
+
 int noam_value_is_instance(noam_value* value, noam_token type){
     return value->vtable_->type == type;
 }
@@ -677,6 +803,17 @@ noam_string_value* noam_string_value_create(noam_buffer* str){
     string_value->str = noam_buffer_create(1);
     noam_buffer_merge(string_value->str, str);
     return string_value;
+}
+
+noam_bool_value* noam_bool_value_create(int value){
+    static noam_value_vtable_ noam_bool_value_vtable[] = {{&noam_bool_value_get,
+                                                           NULL,
+                                                           &noam_bool_value_to_string,
+                                                           NOAM_BOOL_TOKEN}};
+    noam_bool_value* bool_value = malloc(sizeof(noam_bool_value));
+    bool_value->vtable_ = noam_bool_value_vtable;
+    bool_value->value = value;
+    return bool_value;
 }
 
 int noam_convertible_to_float(noam_value* lhs, noam_value* rhs){
@@ -788,8 +925,9 @@ noam_expression* noam_parse_atomic(noam_parser* parser, noam_symbol_table* symbo
     } else if(noam_match_token(parser, NOAM_FLOAT_TOKEN)){
         return noam_float_value_create(atof(noam_get_token_info(parser, -1)->name->data));
     } else if(noam_match_token(parser, NOAM_STRING_TOKEN)){
-        noam_token_info* info = noam_get_token_info(parser, -1);
-        return noam_string_value_create(info->name);
+        return noam_string_value_create(noam_get_token_info(parser, -1)->name);
+    } else if(noam_match_token(parser, NOAM_BOOL_TOKEN)){
+        return noam_bool_value_create(noam_atob(noam_get_token_info(parser, -1)->name->data));
     } else if(noam_match_token(parser, NOAM_LP_TOKEN)){
         noam_expression* expression = noam_parse_expression(parser, symbol_table, current_scope);
 
@@ -998,12 +1136,12 @@ noam_buffer* noam_parse_block(noam_parser* parser, noam_symbol_table* symbol_tab
                     info->name, expression, current_scope
             );
             noam_buffer_push(statements, &assigment_statement);
-        } else if (noam_match_token_str(parser, NOAM_PRINT_TOKEN)){
+        } else if (noam_match_token_str(parser, NOAM_PRINT_TOKEN_STR)){
             void* print_statement = noam_print_statement_create(
                     noam_parse_expression(parser, symbol_table, current_scope)
             );
             noam_buffer_push(statements, &print_statement);
-        } else if(noam_match_token_str(parser, NOAM_IF_TOKEN)){
+        } else if(noam_match_token_str(parser, NOAM_IF_TOKEN_STR)){
             noam_expression* expression = noam_parse_expression(parser, symbol_table, current_scope);
             //noam_consume_token(parser, NOAM_LB_TOKEN);
 
@@ -1108,7 +1246,7 @@ noam_buffer* noam_parse_statements(noam_parser* parser, noam_symbol_table* symbo
     noam_scope* last_scope = NULL;
 
     while(noam_parser_end(parser)){
-        if(noam_match_token_str(parser, NOAM_FUNC_TOKEN)){
+        if(noam_match_token_str(parser, NOAM_FUNC_TOKEN_STR)){
             noam_parse_func(parser, symbol_table, last_scope);
         } else {
             noam_buffer* block = noam_parse_block(parser, symbol_table, symbol_table->head);
